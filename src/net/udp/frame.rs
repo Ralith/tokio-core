@@ -26,6 +26,9 @@ pub trait UdpCodec {
     /// The type of frames to be encoded.
     type Out;
 
+    /// The type of fatal decoding errors.
+    type Error;
+
     /// Attempts to decode a frame from the provided buffer of bytes.
     ///
     /// This method is called by `UdpFramed` on a single datagram which has been
@@ -37,7 +40,7 @@ pub trait UdpCodec {
     /// Finally, if the bytes in the buffer are malformed then an error is
     /// returned indicating why. This informs `Framed` that the stream is now
     /// corrupt and should be terminated.
-    fn decode(&mut self, src: &SocketAddr, buf: &[u8]) -> io::Result<Self::In>;
+    fn decode(&mut self, src: &SocketAddr, buf: &[u8]) -> Result<Self::In, Self::Error>;
 
     /// Encodes a frame into the buffer provided.
     ///
@@ -63,16 +66,32 @@ pub struct UdpFramed<C> {
     out_addr: SocketAddr,
 }
 
-impl<C: UdpCodec> Stream for UdpFramed<C> {
-    type Item = C::In;
-    type Error = io::Error;
+impl<C: UdpCodec> Stream for UdpFramed<C>
+    where C::Error: From<io::Error>
+{
+    type Item = io::Result<C::In>;
+    type Error = C::Error;
 
-    fn poll(&mut self) -> Poll<Option<C::In>, io::Error> {
-        let (n, addr) = try_nb!(self.socket.recv_from(&mut self.rd));
-        trace!("received {} bytes, decoding", n);
-        let frame = try!(self.codec.decode(&addr, &self.rd[..n]));
-        trace!("frame decoded from buffer");
-        Ok(Async::Ready(Some(frame)))
+    fn poll(&mut self) -> Poll<Option<io::Result<C::In>>, C::Error> {
+        match self.socket.recv_from(&mut self.rd) {
+            Ok((n, addr)) => {
+                trace!("received {} bytes, decoding", n);
+                let frame = try!(self.codec.decode(&addr, &self.rd[..n]));
+                trace!("frame decoded from buffer");
+                Ok(Async::Ready(Some(Ok(frame))))
+            }
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => Ok(Async::NotReady),
+            Err(e) => {
+                // UDP reads can produce ECONNRESET if an ICMP error is
+                // received, but (unlike for TCP) this says nothing about
+                // whether future reads will succeed.
+                if e.kind() == io::ErrorKind::ConnectionReset {
+                    Ok(Async::Ready(Some(Err(e))))
+                } else {
+                    Err(e.into())
+                }
+            },
+        }
     }
 }
 
@@ -100,7 +119,22 @@ impl<C: UdpCodec> Sink for UdpFramed<C> {
         }
 
         trace!("writing; remaining={}", self.wr.len());
-        let n = try_nb!(self.socket.send_to(&self.wr, &self.out_addr));
+        let n = match self.socket.send_to(&self.wr, &self.out_addr) {
+            Ok(n) => n,
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(Async::NotReady),
+
+            // Linux can return EPERM if the firewall packet queue is full. We
+            // drop the message because we have no way of being informed when
+            // the queue is no longer full, but do not return an error from the
+            // sink because future writes are likely to succeed.
+            Err(ref e) if e.kind() == io::ErrorKind::PermissionDenied => {
+                trace!("dropped datagram due to EPERM");
+                self.wr.clear();
+                return Ok(Async::Ready(()))
+            },
+
+            Err(e) => return Err(e),
+        };
         trace!("written {}", n);
         let wrote_all = n == self.wr.len();
         self.wr.clear();
