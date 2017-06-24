@@ -254,6 +254,13 @@ impl Core {
         self.poll(max_wait);
     }
 
+    /// Run the event loop until all spawned futures complete.
+    pub fn run_until_finished(&mut self) {
+        while self.inner.borrow().live() {
+            self.turn(None);
+        }
+    }
+
     fn poll(&mut self, max_wait: Option<Duration>) -> bool {
         // Given the `max_wait` variable specified, figure out the actual
         // timeout that we're going to pass to `poll`. This involves taking a
@@ -569,6 +576,11 @@ impl Inner {
             wake: Some(unpark),
             _registration: pair.0,
         });
+    }
+
+    /// Deterimne whether the core has work scheduled
+    fn live(&self) -> bool {
+        !self.io_dispatch.is_empty() || !self.task_dispatch.is_empty() || !self.timeouts.is_empty()
     }
 }
 

@@ -6,6 +6,8 @@ use std::any::Any;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
+use std::rc::Rc;
+use std::cell::Cell;
 
 use futures::{Future, Poll};
 use futures::future;
@@ -144,4 +146,17 @@ fn spawn_in_drop() {
     });
 
     lp.run(rx).unwrap();
+}
+
+#[test]
+fn run_until_finished() {
+    drop(env_logger::init());
+    let mut lp = Core::new().unwrap();
+    let ran = Rc::new(Cell::new(false));
+    {
+        let ran = ran.clone();
+        lp.handle().spawn(future::lazy(move || { ran.set(true); Ok(()) }));
+    }
+    lp.run_until_finished();
+    assert!(ran.get());
 }
